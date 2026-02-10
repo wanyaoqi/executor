@@ -44,6 +44,18 @@ type Commander struct {
 	wg       *sync.WaitGroup
 	stdoutCh chan struct{}
 	stderrCh chan struct{}
+	
+	// Buffers to store stdout/stderr data before FetchStdout/FetchStderr is called
+	stdoutBuf []byte
+	stderrBuf []byte
+	stdoutMu  sync.Mutex
+	stderrMu  sync.Mutex
+	
+	// Flags to indicate if FetchStdout/FetchStderr has been called
+	stdoutFetched bool
+	stderrFetched bool
+	stdoutFetchedMu sync.Mutex
+	stderrFetchedMu sync.Mutex
 }
 
 func BytesArrayToStrArray(ba [][]byte) []string {
@@ -109,6 +121,34 @@ func (e *Executor) Start(ctx context.Context, req *apis.StartInput) (*apis.Start
 			}, nil
 		}
 		m.stdoutCh = make(chan struct{})
+		// Start reading stdout immediately to avoid data loss when process completes quickly
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			data := make([]byte, 4096)
+			for {
+				// Check if FetchStdout has been called
+				m.stdoutFetchedMu.Lock()
+				fetched := m.stdoutFetched
+				m.stdoutFetchedMu.Unlock()
+				if fetched {
+					// FetchStdout has been called, stop buffering
+					return
+				}
+				
+				n, err := m.stdout.Read(data)
+				if n > 0 {
+					m.stdoutMu.Lock()
+					m.stdoutBuf = append(m.stdoutBuf, data[:n]...)
+					m.stdoutMu.Unlock()
+				}
+				if err == io.EOF {
+					return
+				} else if err != nil {
+					return
+				}
+			}
+		}()
 	}
 	if req.HasStderr {
 		m.stderr, err = m.c.StderrPipe()
@@ -119,6 +159,34 @@ func (e *Executor) Start(ctx context.Context, req *apis.StartInput) (*apis.Start
 			}, nil
 		}
 		m.stderrCh = make(chan struct{})
+		// Start reading stderr immediately to avoid data loss when process completes quickly
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			data := make([]byte, 4096)
+			for {
+				// Check if FetchStderr has been called
+				m.stderrFetchedMu.Lock()
+				fetched := m.stderrFetched
+				m.stderrFetchedMu.Unlock()
+				if fetched {
+					// FetchStderr has been called, stop buffering
+					return
+				}
+				
+				n, err := m.stderr.Read(data)
+				if n > 0 {
+					m.stderrMu.Lock()
+					m.stderrBuf = append(m.stderrBuf, data[:n]...)
+					m.stderrMu.Unlock()
+				}
+				if err == io.EOF {
+					return
+				} else if err != nil {
+					return
+				}
+			}
+		}()
 	}
 
 	if err := m.c.Start(); err != nil {
@@ -243,12 +311,7 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 	if !ok {
 		return errors.Errorf("unknown sn %d", sn.Sn)
 	}
-	var (
-		m    = icm.(*Commander)
-		data = make([]byte, 4096)
-		err  error
-		n    int
-	)
+	m := icm.(*Commander)
 
 	if m.stdout == nil {
 		return errors.New("Process stdout not init")
@@ -256,6 +319,11 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 
 	m.wg.Add(1)
 	defer m.wg.Done()
+	
+	// Mark that FetchStdout has been called, so the background goroutine stops buffering
+	m.stdoutFetchedMu.Lock()
+	m.stdoutFetched = true
+	m.stdoutFetchedMu.Unlock()
 	
 	// Send Start message first to establish the stream before closing stdoutCh
 	// This ensures the client is ready to receive data before we start reading
@@ -266,11 +334,26 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 	// Close stdoutCh after stream is established to signal readiness
 	close(m.stdoutCh)
 	
+	// First, send any buffered data that was read before FetchStdout was called
+	m.stdoutMu.Lock()
+	if len(m.stdoutBuf) > 0 {
+		buf := make([]byte, len(m.stdoutBuf))
+		copy(buf, m.stdoutBuf)
+		m.stdoutBuf = m.stdoutBuf[:0] // Clear buffer
+		m.stdoutMu.Unlock()
+		if err := s.Send(&apis.Stdout{Stdout: buf}); err != nil {
+			return err
+		}
+	} else {
+		m.stdoutMu.Unlock()
+	}
+	
+	// Then continue reading from stdout
+	data := make([]byte, 4096)
 	for {
-		n, err = m.stdout.Read(data)
+		n, err := m.stdout.Read(data)
 		if err == io.EOF {
 			// Even if EOF, we should send any data we read before closing
-			// This is critical when process completes very quickly before FetchStdout starts reading
 			if n > 0 {
 				if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
 					return err
@@ -291,8 +374,7 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 		
 		// Only send if we actually read data (n > 0)
 		if n > 0 {
-			err = s.Send(&apis.Stdout{Stdout: data[:n]})
-			if err != nil {
+			if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
 				return err
 			}
 		}
@@ -304,12 +386,7 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 	if !ok {
 		return errors.Errorf("unknown sn %d", sn.Sn)
 	}
-	var (
-		m    = icm.(*Commander)
-		data = make([]byte, 4096)
-		err  error
-		n    int
-	)
+	m := icm.(*Commander)
 
 	if m.stderr == nil {
 		return errors.New("Process stderr not init")
@@ -317,6 +394,11 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 
 	m.wg.Add(1)
 	defer m.wg.Done()
+	
+	// Mark that FetchStderr has been called, so the background goroutine stops buffering
+	m.stderrFetchedMu.Lock()
+	m.stderrFetched = true
+	m.stderrFetchedMu.Unlock()
 	
 	// Send Start message first to establish the stream before closing stderrCh
 	// This ensures the client is ready to receive data before we start reading
@@ -327,11 +409,26 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 	// Close stderrCh after stream is established to signal readiness
 	close(m.stderrCh)
 	
+	// First, send any buffered data that was read before FetchStderr was called
+	m.stderrMu.Lock()
+	if len(m.stderrBuf) > 0 {
+		buf := make([]byte, len(m.stderrBuf))
+		copy(buf, m.stderrBuf)
+		m.stderrBuf = m.stderrBuf[:0] // Clear buffer
+		m.stderrMu.Unlock()
+		if err := s.Send(&apis.Stderr{Stderr: buf}); err != nil {
+			return err
+		}
+	} else {
+		m.stderrMu.Unlock()
+	}
+	
+	// Then continue reading from stderr
+	data := make([]byte, 4096)
 	for {
-		n, err = m.stderr.Read(data)
+		n, err := m.stderr.Read(data)
 		if err == io.EOF {
 			// Even if EOF, we should send any data we read before closing
-			// This is critical when process completes very quickly before FetchStderr starts reading
 			if n > 0 {
 				if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
 					return err
@@ -352,8 +449,7 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 		
 		// Only send if we actually read data (n > 0)
 		if n > 0 {
-			err = s.Send(&apis.Stderr{Stderr: data[:n]})
-			if err != nil {
+			if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
 				return err
 			}
 		}
