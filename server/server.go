@@ -252,25 +252,49 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 
 	if m.stdout == nil {
 		return errors.New("Process stdout not init")
-	} else {
-		close(m.stdoutCh)
 	}
 
 	m.wg.Add(1)
 	defer m.wg.Done()
-	s.Send(&apis.Stdout{Start: true})
+	
+	// Send Start message first to establish the stream before closing stdoutCh
+	// This ensures the client is ready to receive data before we start reading
+	if err := s.Send(&apis.Stdout{Start: true}); err != nil {
+		return err
+	}
+	
+	// Close stdoutCh after stream is established to signal readiness
+	close(m.stdoutCh)
+	
 	for {
 		n, err = m.stdout.Read(data)
 		if err == io.EOF {
+			// Even if EOF, we should send any data we read before closing
+			// This is critical when process completes very quickly before FetchStdout starts reading
+			if n > 0 {
+				if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			// Even if closed, we should send any data we read before closing
+			if n > 0 {
+				if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stdout{RuntimeError: []byte(err.Error())})
 		}
-		err = s.Send(&apis.Stdout{Stdout: data[:n]})
-		if err != nil {
-			return err
+		
+		// Only send if we actually read data (n > 0)
+		if n > 0 {
+			err = s.Send(&apis.Stdout{Stdout: data[:n]})
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -289,25 +313,49 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 
 	if m.stderr == nil {
 		return errors.New("Process stderr not init")
-	} else {
-		close(m.stderrCh)
 	}
 
 	m.wg.Add(1)
 	defer m.wg.Done()
-	s.Send(&apis.Stderr{Start: true})
+	
+	// Send Start message first to establish the stream before closing stderrCh
+	// This ensures the client is ready to receive data before we start reading
+	if err := s.Send(&apis.Stderr{Start: true}); err != nil {
+		return err
+	}
+	
+	// Close stderrCh after stream is established to signal readiness
+	close(m.stderrCh)
+	
 	for {
 		n, err = m.stderr.Read(data)
 		if err == io.EOF {
+			// Even if EOF, we should send any data we read before closing
+			// This is critical when process completes very quickly before FetchStderr starts reading
+			if n > 0 {
+				if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			// Even if closed, we should send any data we read before closing
+			if n > 0 {
+				if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stderr{RuntimeError: []byte(err.Error())})
 		}
-		err = s.Send(&apis.Stderr{Stderr: data[:n]})
-		if err != nil {
-			return err
+		
+		// Only send if we actually read data (n > 0)
+		if n > 0 {
+			err = s.Send(&apis.Stderr{Stderr: data[:n]})
+			if err != nil {
+				return err
+			}
 		}
 	}
 }
