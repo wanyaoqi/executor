@@ -262,8 +262,18 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 	for {
 		n, err = m.stdout.Read(data)
 		if err == io.EOF {
+			if n > 0 {
+				if err = s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			if n > 0 {
+				if err = s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stdout{RuntimeError: []byte(err.Error())})
@@ -299,8 +309,18 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 	for {
 		n, err = m.stderr.Read(data)
 		if err == io.EOF {
+			if n > 0 {
+				if err = s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			if n > 0 {
+				if err = s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stderr{RuntimeError: []byte(err.Error())})
