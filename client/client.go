@@ -555,24 +555,25 @@ func (c *Cmd) fetchStdout(w io.WriteCloser) {
 	for {
 		data, err := stream.Recv()
 		if err == io.EOF {
-			close(c.stdoutCh)
 			return
 		} else if err != nil {
-			close(c.stdoutCh)
 			c.streamStdout = errors.Wrap(err, "grpc stdout recv")
 			return
 		}
-		if data.Closed {
-			return
-		} else if len(data.RuntimeError) > 0 {
-			c.streamStdout = errors.New(string(data.RuntimeError))
-			return
-		} else {
-			err := writeTo(data.Stdout, w)
-			if err != nil {
+		// Always write stdout data first if present, even when Closed is true.
+		// This avoids losing the last chunk when server sends Stdout then Closed.
+		if len(data.Stdout) > 0 {
+			if err := writeTo(data.Stdout, w); err != nil {
 				c.streamStdout = errors.Wrap(err, "write to stdout")
 				return
 			}
+		}
+		if data.Closed {
+			return
+		}
+		if len(data.RuntimeError) > 0 {
+			c.streamStdout = errors.New(string(data.RuntimeError))
+			return
 		}
 	}
 }
@@ -612,17 +613,19 @@ func (c *Cmd) fetchStderr(w io.WriteCloser) {
 			c.streamStderr = errors.Wrap(err, "grpc stderr recv")
 			return
 		}
-		if data.Closed {
-			return
-		} else if len(data.RuntimeError) > 0 {
-			c.streamStderr = errors.New(string(data.RuntimeError))
-			return
-		} else {
-			err := writeTo(data.Stderr, w)
-			if err != nil {
+		// Always write stderr data first if present, even when Closed is true.
+		if len(data.Stderr) > 0 {
+			if err := writeTo(data.Stderr, w); err != nil {
 				c.streamStderr = errors.Wrap(err, "write to stderr")
 				return
 			}
+		}
+		if data.Closed {
+			return
+		}
+		if len(data.RuntimeError) > 0 {
+			c.streamStderr = errors.New(string(data.RuntimeError))
+			return
 		}
 	}
 }
