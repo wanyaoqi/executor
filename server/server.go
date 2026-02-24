@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -45,6 +46,53 @@ type Commander struct {
 	stdoutData chan []byte // filled by background reader, consumed by FetchStdout
 	stderrData chan []byte
 	stdinFile  *os.File // /dev/null when no stdin, closed in Wait
+}
+
+// readPipeToChan reads from r until EOF and sends each chunk to ch, then closes ch.
+// When the process exits very quickly, the first Read may return (0, io.EOF) before
+// data is visible; we retry a few times so output is not lost.
+func readPipeToChan(r io.Reader, ch chan<- []byte, bufSize int) {
+	buf := make([]byte, bufSize)
+	firstRead := true
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			ch <- append([]byte(nil), buf[:n]...)
+			firstRead = false
+		}
+		if err == io.EOF {
+			if firstRead {
+				const maxRetries = 8
+				for retry := 0; retry < maxRetries; retry++ {
+					time.Sleep(time.Duration(5+retry*5) * time.Millisecond)
+					n, err = r.Read(buf)
+					if n > 0 {
+						ch <- append([]byte(nil), buf[:n]...)
+						firstRead = false
+						break
+					}
+					if err != nil && err != io.EOF {
+						break
+					}
+					if err == io.EOF {
+						break
+					}
+				}
+				if firstRead {
+					close(ch)
+					return
+				}
+				// got data in retry, continue to read more
+				continue
+			}
+			close(ch)
+			return
+		}
+		if err != nil {
+			close(ch)
+			return
+		}
+	}
 }
 
 func BytesArrayToStrArray(ba [][]byte) []string {
@@ -152,36 +200,13 @@ func (e *Executor) Start(ctx context.Context, req *apis.StartInput) (*apis.Start
 		}, nil
 	}
 
-	// Start reading stdout/stderr immediately so we never miss data (avoids race with fast-exit commands)
+	// Start reading stdout/stderr immediately so we never miss data (avoids race with fast-exit commands).
+	// When process exits very fast, first Read() can return (0, EOF) before kernel delivers data; retry on that.
 	if m.stdout != nil {
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := m.stdout.Read(buf)
-				if n > 0 {
-					m.stdoutData <- append([]byte(nil), buf[:n]...)
-				}
-				if err != nil {
-					close(m.stdoutData)
-					return
-				}
-			}
-		}()
+		go readPipeToChan(m.stdout, m.stdoutData, 4096)
 	}
 	if m.stderr != nil {
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := m.stderr.Read(buf)
-				if n > 0 {
-					m.stderrData <- append([]byte(nil), buf[:n]...)
-				}
-				if err != nil {
-					close(m.stderrData)
-					return
-				}
-			}
-		}()
+		go readPipeToChan(m.stderr, m.stderrData, 4096)
 	}
 
 	return &apis.StartResponse{
