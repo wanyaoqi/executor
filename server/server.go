@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -259,15 +260,55 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 	m.wg.Add(1)
 	defer m.wg.Done()
 	s.Send(&apis.Stdout{Start: true})
+	firstRead := true
 	for {
 		n, err = m.stdout.Read(data)
 		if err == io.EOF {
+			// io.Reader may return (n>0, io.EOF) for final chunk; must send data before Closed
+			if n > 0 {
+				if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			} else if firstRead {
+				// First read returned (0, EOF): process may have exited before we read (race).
+				// Retry a few times; data can still be in kernel pipe buffer.
+				for retry := 0; retry < 5; retry++ {
+					time.Sleep(time.Duration(10+retry*10) * time.Millisecond)
+					n, err = m.stdout.Read(data)
+					if n > 0 {
+						if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+							return err
+						}
+						firstRead = false
+						// continue outer loop to read more
+						break
+					}
+					if err != nil && err != io.EOF {
+						return s.Send(&apis.Stdout{RuntimeError: []byte(err.Error())})
+					}
+					if err == io.EOF {
+						break
+					}
+				}
+				if n == 0 {
+					return s.Send(&apis.Stdout{Closed: true})
+				}
+				continue
+			} else {
+				return s.Send(&apis.Stdout{Closed: true})
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			if n > 0 {
+				if err := s.Send(&apis.Stdout{Stdout: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stdout{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stdout{RuntimeError: []byte(err.Error())})
 		}
+		firstRead = false
 		err = s.Send(&apis.Stdout{Stdout: data[:n]})
 		if err != nil {
 			return err
@@ -296,15 +337,51 @@ func (e *Executor) FetchStderr(sn *apis.Sn, s apis.Executor_FetchStderrServer) e
 	m.wg.Add(1)
 	defer m.wg.Done()
 	s.Send(&apis.Stderr{Start: true})
+	firstRead := true
 	for {
 		n, err = m.stderr.Read(data)
 		if err == io.EOF {
+			if n > 0 {
+				if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			} else if firstRead {
+				for retry := 0; retry < 5; retry++ {
+					time.Sleep(time.Duration(10+retry*10) * time.Millisecond)
+					n, err = m.stderr.Read(data)
+					if n > 0 {
+						if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+							return err
+						}
+						firstRead = false
+						break
+					}
+					if err != nil && err != io.EOF {
+						return s.Send(&apis.Stderr{RuntimeError: []byte(err.Error())})
+					}
+					if err == io.EOF {
+						break
+					}
+				}
+				if n == 0 {
+					return s.Send(&apis.Stderr{Closed: true})
+				}
+				continue
+			} else {
+				return s.Send(&apis.Stderr{Closed: true})
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if pe, ok := err.(*os.PathError); ok && pe.Err == os.ErrClosed {
+			if n > 0 {
+				if err := s.Send(&apis.Stderr{Stderr: data[:n]}); err != nil {
+					return err
+				}
+			}
 			return s.Send(&apis.Stderr{Closed: true})
 		} else if err != nil {
 			return s.Send(&apis.Stderr{RuntimeError: []byte(err.Error())})
 		}
+		firstRead = false
 		err = s.Send(&apis.Stderr{Stderr: data[:n]})
 		if err != nil {
 			return err
