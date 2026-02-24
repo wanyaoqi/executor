@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -168,7 +169,15 @@ func (c *Cmd) Output() ([]byte, error) {
 		}
 		return nil, err
 	}
-	return stdout.Bytes(), nil
+	out := stdout.Bytes()
+	if len(out) == 0 {
+		sn := uint32(0)
+		if c.sn != nil {
+			sn = c.sn.Sn
+		}
+		log.Printf("[executor client] sn=%d Output: Run() succeeded but stdout is empty (stderr len=%d)", sn, len(stderr.Bytes()))
+	}
+	return out, nil
 }
 
 func (c *Cmd) Start() error {
@@ -534,8 +543,13 @@ func (c *Cmd) fetchStdout(w io.WriteCloser) {
 
 	c.wg.Add(1)
 	defer c.wg.Done()
+	sn := uint32(0)
+	if c.sn != nil {
+		sn = c.sn.Sn
+	}
 	stream, err := c.client.FetchStdout(context.Background(), c.sn)
 	if err != nil {
+		log.Printf("[executor client] sn=%d fetchStdout: FetchStdout err=%v", sn, err)
 		close(c.stdoutCh)
 		c.streamStdout = errors.Wrap(err, "grpc fetch stdout")
 		return
@@ -544,31 +558,39 @@ func (c *Cmd) fetchStdout(w io.WriteCloser) {
 	data, err := stream.Recv()
 	close(c.stdoutCh)
 	if err != nil {
+		log.Printf("[executor client] sn=%d fetchStdout: first Recv err=%v", sn, err)
 		c.streamStdout = errors.Wrap(err, "stream stdout")
 		return
 	}
 	if !data.Start {
+		log.Printf("[executor client] sn=%d fetchStdout: first message not Start", sn)
 		c.streamStdout = errors.Wrap(err, "stream stdout not start")
 		return
 	}
+	log.Printf("[executor client] sn=%d fetchStdout: got Start, receiving stream", sn)
 
+	var totalRecv int
+	var msgCount int
 	for {
 		data, err := stream.Recv()
 		if err == io.EOF {
+			log.Printf("[executor client] sn=%d fetchStdout: stream EOF, totalRecv=%d msgCount=%d", sn, totalRecv, msgCount)
 			return
 		} else if err != nil {
+			log.Printf("[executor client] sn=%d fetchStdout: Recv err=%v totalRecv=%d", sn, err, totalRecv)
 			c.streamStdout = errors.Wrap(err, "grpc stdout recv")
 			return
 		}
-		// Always write stdout data first if present, even when Closed is true.
-		// This avoids losing the last chunk when server sends Stdout then Closed.
+		msgCount++
 		if len(data.Stdout) > 0 {
+			totalRecv += len(data.Stdout)
 			if err := writeTo(data.Stdout, w); err != nil {
 				c.streamStdout = errors.Wrap(err, "write to stdout")
 				return
 			}
 		}
 		if data.Closed {
+			log.Printf("[executor client] sn=%d fetchStdout: got Closed, totalRecv=%d msgCount=%d", sn, totalRecv, msgCount)
 			return
 		}
 		if len(data.RuntimeError) > 0 {

@@ -51,27 +51,35 @@ type Commander struct {
 // readPipeToChan reads from r until EOF and sends each chunk to ch, then closes ch.
 // When the process exits very quickly, the first Read may return (0, io.EOF) before
 // data is visible; we retry a few times so output is not lost.
-func readPipeToChan(r io.Reader, ch chan<- []byte, bufSize int) {
+func readPipeToChan(r io.Reader, ch chan<- []byte, bufSize int, label string, sn uint32) {
 	buf := make([]byte, bufSize)
 	firstRead := true
+	var totalSent int
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			ch <- append([]byte(nil), buf[:n]...)
+			chunk := append([]byte(nil), buf[:n]...)
+			ch <- chunk
+			totalSent += len(chunk)
 			firstRead = false
 		}
 		if err == io.EOF {
 			if firstRead {
+				log.Warningf("[executor stdout/stderr] sn=%d %s: first Read returned (0, EOF), retrying", sn, label)
 				const maxRetries = 8
 				for retry := 0; retry < maxRetries; retry++ {
 					time.Sleep(time.Duration(5+retry*5) * time.Millisecond)
 					n, err = r.Read(buf)
 					if n > 0 {
-						ch <- append([]byte(nil), buf[:n]...)
+						chunk := append([]byte(nil), buf[:n]...)
+						ch <- chunk
+						totalSent += len(chunk)
 						firstRead = false
+						log.Infof("[executor stdout/stderr] sn=%d %s: retry %d got %d bytes", sn, label, retry, n)
 						break
 					}
 					if err != nil && err != io.EOF {
+						log.Warningf("[executor stdout/stderr] sn=%d %s: retry %d read err=%v", sn, label, retry, err)
 						break
 					}
 					if err == io.EOF {
@@ -79,16 +87,18 @@ func readPipeToChan(r io.Reader, ch chan<- []byte, bufSize int) {
 					}
 				}
 				if firstRead {
+					log.Warningf("[executor stdout/stderr] sn=%d %s: closed channel with 0 bytes after %d retries", sn, label, maxRetries)
 					close(ch)
 					return
 				}
-				// got data in retry, continue to read more
 				continue
 			}
+			log.Infof("[executor stdout/stderr] sn=%d %s: EOF after %d bytes total", sn, label, totalSent)
 			close(ch)
 			return
 		}
 		if err != nil {
+			log.Warningf("[executor stdout/stderr] sn=%d %s: read err=%v, totalSent=%d", sn, label, err, totalSent)
 			close(ch)
 			return
 		}
@@ -203,10 +213,11 @@ func (e *Executor) Start(ctx context.Context, req *apis.StartInput) (*apis.Start
 	// Start reading stdout/stderr immediately so we never miss data (avoids race with fast-exit commands).
 	// When process exits very fast, first Read() can return (0, EOF) before kernel delivers data; retry on that.
 	if m.stdout != nil {
-		go readPipeToChan(m.stdout, m.stdoutData, 4096)
+		log.Infof("[executor] sn=%d Start: spawning stdout reader", req.Sn)
+		go readPipeToChan(m.stdout, m.stdoutData, 4096, "stdout", req.Sn)
 	}
 	if m.stderr != nil {
-		go readPipeToChan(m.stderr, m.stderrData, 4096)
+		go readPipeToChan(m.stderr, m.stderrData, 4096, "stderr", req.Sn)
 	}
 
 	return &apis.StartResponse{
@@ -335,16 +346,23 @@ func (e *Executor) FetchStdout(sn *apis.Sn, s apis.Executor_FetchStdoutServer) e
 	}
 	close(m.stdoutCh)
 
+	log.Infof("[executor] sn=%d FetchStdout: stream opened, reading from channel", sn.Sn)
 	m.wg.Add(1)
 	defer m.wg.Done()
 	if err := s.Send(&apis.Stdout{Start: true}); err != nil {
 		return err
 	}
+	var chunks int
+	var totalBytes int
 	for b := range m.stdoutData {
+		chunks++
+		totalBytes += len(b)
 		if err := s.Send(&apis.Stdout{Stdout: b}); err != nil {
+			log.Warningf("[executor] sn=%d FetchStdout: Send err=%v after %d chunks %d bytes", sn.Sn, err, chunks, totalBytes)
 			return err
 		}
 	}
+	log.Infof("[executor] sn=%d FetchStdout: channel closed, sent %d chunks %d bytes, sending Closed", sn.Sn, chunks, totalBytes)
 	return s.Send(&apis.Stdout{Closed: true})
 }
 
