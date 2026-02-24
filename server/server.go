@@ -231,39 +231,33 @@ func (e *Executor) Wait(ctx context.Context, in *apis.Sn) (*apis.WaitResponse, e
 	if !ok {
 		return nil, errors.Errorf("unknown sn %d", in.Sn)
 	}
-	var (
-		m   = icm.(*Commander)
-		err error
-	)
+	m := icm.(*Commander)
 
-	err = m.c.Wait()
-	var (
-		exitStatus uint32
-		errContent string
-	)
-	if err != nil {
-		if exiterr, ok := err.(*exec.ExitError); ok {
-			// The program has exited with an exit code != 0
-			// This works on both Unix and Windows. Although package
-			// syscall is generally platform dependent, WaitStatus is
-			// defined for both Unix and Windows and in both cases has
-			// an ExitStatus() method with the same signature.
-			exitStatus = uint32(exiterr.Sys().(syscall.WaitStatus))
-		} else {
-			// command not found or io problem or wait was already called
-			errContent = err.Error()
-		}
-	} else {
-		exitStatus = 0
-	}
+	// Must wait for stdout/stderr to be fully read BEFORE calling m.c.Wait().
+	// Once m.c.Wait() returns, exec.Cmd may close the pipe FDs; our reader
+	// goroutines would then get "read |0: file already closed" and miss data.
 	if m.stdout != nil {
 		<-m.stdoutCh
 	}
 	if m.stderr != nil {
 		<-m.stderrCh
 	}
-
 	m.wg.Wait()
+
+	err := m.c.Wait()
+	var (
+		exitStatus uint32
+		errContent string
+	)
+	if err != nil {
+		if exiterr, ok := err.(*exec.ExitError); ok {
+			exitStatus = uint32(exiterr.Sys().(syscall.WaitStatus))
+		} else {
+			errContent = err.Error()
+		}
+	} else {
+		exitStatus = 0
+	}
 	if m.stdinFile != nil {
 		m.stdinFile.Close()
 		m.stdinFile = nil
